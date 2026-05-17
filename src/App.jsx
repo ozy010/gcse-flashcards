@@ -9,45 +9,69 @@ function shuffle(arr) {
 }
 
 export default function App() {
-  const [screen, setScreen]           = useState(SCREEN.SELECT)
-  const [papers, setPapers]           = useState([])
-  const [topics, setTopics]           = useState([])
+  const [screen, setScreen]               = useState(SCREEN.SELECT)
+  const [allPapers, setAllPapers]         = useState([])
+  const [topics, setTopics]               = useState([])
+  const [topicsLoading, setTopicsLoading] = useState(false)
   const [selectedPaper, setSelectedPaper] = useState(null)
   const [selectedTopic, setSelectedTopic] = useState(null)
-  const [cards, setCards]             = useState([])
-  const [results, setResults]         = useState([])
-  const [loading, setLoading]         = useState(true)
-  const [error, setError]             = useState(null)
+  const [cards, setCards]                 = useState([])
+  const [results, setResults]             = useState([])
+  const [loading, setLoading]             = useState(true)
+  const [error, setError]                 = useState(null)
 
+  // Load only papers that have at least one published flashcard
   useEffect(() => {
-    async function loadPapers() {
+    async function load() {
       setLoading(true)
-      const { data, error } = await supabase
+      const { data: pubCards, error: e1 } = await supabase
+        .from("flashcard")
+        .select("paper_id")
+        .eq("is_published", true)
+        .not("paper_id", "is", null)
+      if (e1) { setError(e1.message); setLoading(false); return }
+
+      const paperIds = [...new Set((pubCards || []).map(f => f.paper_id))]
+      if (paperIds.length === 0) { setAllPapers([]); setLoading(false); return }
+
+      const { data, error: e2 } = await supabase
         .from("paper")
         .select(`
-          id, paper_number, paper_name, year, season,
-          subject!inner ( id, name, qualification,
-            exam_board!inner ( name, slug ) )
+          id, paper_number, paper_name, year,
+          subject!inner(id, name,
+            exam_board!inner(id, name, slug)
+          )
         `)
-        .eq("subject.exam_board.slug", "edexcel")
+        .in("id", paperIds)
         .order("paper_number")
         .order("year", { ascending: false })
-      if (error) { setError(error.message); setLoading(false); return }
-      setPapers(data || [])
+      if (e2) { setError(e2.message); setLoading(false); return }
+      setAllPapers(data || [])
       setLoading(false)
     }
-    loadPapers()
+    load()
   }, [])
 
+  // Load only topics that have published cards for the selected paper
   useEffect(() => {
-    if (!selectedPaper) return
+    if (!selectedPaper) { setTopics([]); return }
+    setTopicsLoading(true)
     async function loadTopics() {
-      const { data, error } = await supabase
+      const { data: pubCards } = await supabase
+        .from("flashcard")
+        .select("topic_id")
+        .eq("paper_id", selectedPaper.id)
+        .eq("is_published", true)
+        .not("topic_id", "is", null)
+      const ids = [...new Set((pubCards || []).map(c => c.topic_id))]
+      if (ids.length === 0) { setTopics([]); setTopicsLoading(false); return }
+      const { data } = await supabase
         .from("topic")
-        .select("id, name, slug, display_order")
-        .eq("subject_id", selectedPaper.subject.id)
+        .select("id, name, display_order")
+        .in("id", ids)
         .order("display_order")
-      if (!error) setTopics(data || [])
+      setTopics(data || [])
+      setTopicsLoading(false)
     }
     loadTopics()
   }, [selectedPaper])
@@ -99,18 +123,15 @@ export default function App() {
     <div className="app">
       <header className="app-header">
         <div className="header-inner">
-          <span className="logo">GCSE Revision</span>
-          <div className="header-pills">
-            <span className="pill pill-purple">Edexcel</span>
-            <span className="pill pill-gray">Geography B</span>
-          </div>
+          <h1 className="brand-title">Locked In Learning</h1>
         </div>
       </header>
       <main className="app-main">
         {screen === SCREEN.SELECT && (
           <SelectScreen
-            papers={papers}
+            allPapers={allPapers}
             topics={topics}
+            topicsLoading={topicsLoading}
             selectedPaper={selectedPaper}
             selectedTopic={selectedTopic}
             onSelectPaper={p => { setSelectedPaper(p); setSelectedTopic(null) }}
@@ -146,100 +167,189 @@ export default function App() {
   )
 }
 
-function SelectScreen({ papers, topics, selectedPaper, selectedTopic, onSelectPaper, onSelectTopic, onStart, loading }) {
-  const grouped = papers.reduce((acc, p) => {
+// ── Select screen ─────────────────────────────────────────────────────────────
+function SelectScreen({ allPapers, topics, topicsLoading, selectedPaper, selectedTopic, onSelectPaper, onSelectTopic, onStart, loading }) {
+  const [subjectName, setSubjectName] = useState(null)
+  const [boardSlug, setBoardSlug]     = useState(null)
+  const [paperNum, setPaperNum]       = useState(null)
+
+  // Each level derived only from papers that have published cards
+  const subjectNames = [...new Set(allPapers.map(p => p.subject.name))].sort()
+
+  const papersForSubject = allPapers.filter(p => p.subject.name === subjectName)
+  const boardsForSubject = Object.values(
+    papersForSubject.reduce((acc, p) => {
+      const b = p.subject.exam_board
+      if (!acc[b.slug]) acc[b.slug] = b
+      return acc
+    }, {})
+  )
+
+  const papersForBoard = papersForSubject.filter(p => p.subject.exam_board.slug === boardSlug)
+  const grouped = papersForBoard.reduce((acc, p) => {
     const key = p.paper_number
     if (!acc[key]) acc[key] = []
     acc[key].push(p)
     return acc
   }, {})
   const paperNumbers = Object.keys(grouped).sort()
-  const [activePaperNum, setActivePaperNum] = useState(null)
-  const [activeYear, setActiveYear]         = useState(null)
+  const yearsForPaper = paperNum ? grouped[paperNum] : []
 
+  function handleSubject(name) {
+    setSubjectName(name); setBoardSlug(null); setPaperNum(null)
+    onSelectPaper(null); onSelectTopic(null)
+  }
+  function handleBoard(slug) {
+    setBoardSlug(slug); setPaperNum(null)
+    onSelectPaper(null); onSelectTopic(null)
+  }
   function handlePaperNum(num) {
-    setActivePaperNum(num)
-    setActiveYear(null)
-    onSelectPaper(null)
-    onSelectTopic(null)
+    setPaperNum(num)
+    onSelectPaper(null); onSelectTopic(null)
+  }
+  function handleYear(paper) {
+    onSelectPaper(paper); onSelectTopic(null)
   }
 
-  function handleYear(paper) {
-    setActiveYear(paper.year)
-    onSelectPaper(paper)
-    onSelectTopic(null)
-  }
+  if (loading) return <p className="loading-text">Loading…</p>
+
+  if (allPapers.length === 0) return (
+    <div className="empty-state">No revision materials available yet.</div>
+  )
+
+  const chevron = (
+    <svg className="paper-chevron" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M5.5 3l5 5-5 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+    </svg>
+  )
 
   return (
     <div className="screen-select">
-      <h1 className="screen-title">What are you revising?</h1>
-      {loading && <p className="loading-text">Loading papers…</p>}
-      {!loading && (
-        <>
-          <section className="select-section">
-            <p className="select-label">Select a paper</p>
-            <div className="btn-row">
-              {paperNumbers.map(num => (
-                <button
-                  key={num}
-                  className={`btn-paper ${activePaperNum === num ? "active" : ""}`}
-                  onClick={() => handlePaperNum(num)}
-                >
-                  <span className="paper-number">Paper {num}</span>
-                  <span className="paper-name">{grouped[num][0].paper_name}</span>
-                </button>
-              ))}
-            </div>
-          </section>
-          {activePaperNum && (
-            <section className="select-section">
-              <p className="select-label">Select a year</p>
-              <div className="btn-row">
-                {grouped[activePaperNum].map(paper => (
-                  <button
-                    key={paper.id}
-                    className={`btn-year ${activeYear === paper.year ? "active" : ""}`}
-                    onClick={() => handleYear(paper)}
-                  >
-                    {paper.year}
-                  </button>
-                ))}
+
+      {/* Step 1 — Subject */}
+      <section className="select-section">
+        <p className="select-prompt">What are you revising?</p>
+        <div className="btn-row">
+          {subjectNames.map((name, i) => (
+            <button
+              key={name}
+              className={`btn-paper ${subjectName === name ? "active" : ""}`}
+              onClick={() => handleSubject(name)}
+              style={{ animationDelay: `${i * 120}ms` }}
+            >
+              <div className="paper-btn-text">
+                <span className="paper-name">{name}</span>
               </div>
-            </section>
-          )}
-          {selectedPaper && topics.length > 0 && (
-            <section className="select-section">
-              <p className="select-label">Select a topic</p>
-              <div className="topic-list">
-                <button
-                  className={`btn-topic ${selectedTopic === "all" ? "active" : ""}`}
-                  onClick={() => onSelectTopic("all")}
-                >
-                  <span>All topics</span>
-                </button>
-                {topics.map(t => (
-                  <button
-                    key={t.id}
-                    className={`btn-topic ${selectedTopic === t.id ? "active" : ""}`}
-                    onClick={() => onSelectTopic(t.id)}
-                  >
-                    <span>{t.name}</span>
-                  </button>
-                ))}
-              </div>
-            </section>
-          )}
-          {selectedTopic && (
-            <button className="btn-start" onClick={() => onStart(selectedTopic)}>
-              Start revision
+              {chevron}
             </button>
-          )}
-        </>
+          ))}
+        </div>
+      </section>
+
+      {/* Step 2 — Exam board */}
+      {subjectName && (
+        <section className="select-section">
+          <p className="select-label">Which exam board?</p>
+          <div className="btn-row">
+            {boardsForSubject.map(b => (
+              <button
+                key={b.slug}
+                className={`btn-year ${boardSlug === b.slug ? "active" : ""}`}
+                onClick={() => handleBoard(b.slug)}
+              >
+                {b.name}
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* Step 3 — Paper number */}
+      {boardSlug && (
+        <section className="select-section">
+          <p className="select-label">Choose a paper</p>
+          <div className="btn-row">
+            {paperNumbers.map((num, i) => (
+              <button
+                key={num}
+                className={`btn-paper ${paperNum === num ? "active" : ""}`}
+                onClick={() => handlePaperNum(num)}
+                style={{ animationDelay: `${i * 120}ms` }}
+              >
+                <div className="paper-btn-text">
+                  <span className="paper-number">{num}</span>
+                  <span className="paper-name">{grouped[num][0].paper_name}</span>
+                </div>
+                {chevron}
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* Step 4 — Year */}
+      {paperNum && (
+        <section className="select-section">
+          <p className="select-label">Which year?</p>
+          <div className="btn-row">
+            {yearsForPaper.map(paper => (
+              <button
+                key={paper.id}
+                className={`btn-year ${selectedPaper?.id === paper.id ? "active" : ""}`}
+                onClick={() => handleYear(paper)}
+              >
+                {paper.year}
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* Step 5 — Topic (optional) */}
+      {selectedPaper && topicsLoading && (
+        <p className="loading-text" style={{ marginTop: 4 }}>Loading topics…</p>
+      )}
+      {selectedPaper && !topicsLoading && topics.length > 0 && (
+        <section className="select-section">
+          <p className="select-label">
+            Filter by topic
+            <span className="select-label-hint"> — optional</span>
+          </p>
+          <div className="topic-list">
+            <button
+              className={`btn-topic ${selectedTopic === "all" ? "active" : ""}`}
+              onClick={() => onSelectTopic("all")}
+              style={{ animationDelay: "0ms" }}
+            >
+              <span>All topics</span>
+            </button>
+            {topics.map((t, i) => (
+              <button
+                key={t.id}
+                className={`btn-topic ${selectedTopic === t.id ? "active" : ""}`}
+                onClick={() => onSelectTopic(t.id)}
+                style={{ animationDelay: `${(i + 1) * 80}ms` }}
+              >
+                <span>{t.name}</span>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* Start */}
+      {selectedPaper && !topicsLoading && (
+        <button className="btn-start" onClick={() => onStart(selectedTopic || "all")}>
+          {selectedTopic && selectedTopic !== "all"
+            ? `Start revision — ${topics.find(t => t.id === selectedTopic)?.name}`
+            : "Start revision"}
+        </button>
       )}
     </div>
   )
 }
 
+// ── Card screen ───────────────────────────────────────────────────────────────
 function CardScreen({ cards, paper, topicName, onComplete, onBack }) {
   const [index, setIndex]     = useState(0)
   const [flipped, setFlipped] = useState(false)
@@ -248,9 +358,7 @@ function CardScreen({ cards, paper, topicName, onComplete, onBack }) {
   const total    = cards.length
   const progress = Math.round((index / total) * 100)
 
-  function flip() {
-    if (!flipped) setFlipped(true)
-  }
+  function flip() { if (!flipped) setFlipped(true) }
 
   function mark(knew) {
     const newResults = [...results, { card, knew }]
@@ -275,9 +383,10 @@ function CardScreen({ cards, paper, topicName, onComplete, onBack }) {
         <div className="progress-bar-fill" style={{ width: `${progress}%` }} />
       </div>
       <div className="card-meta">
-        <span className="pill pill-teal">Paper {paper.paper_number}</span>
+        <span className="pill pill-teal">{paper.paper_number}</span>
         <span className="pill pill-gray">{paper.year}</span>
-        {card.question_ref && <span className="pill pill-purple">{card.question_ref}</span>}
+        {topicName && <span className="pill pill-purple">{topicName}</span>}
+        {card.question_ref && <span className="pill pill-gray">{card.question_ref}</span>}
       </div>
       <div
         className={`card-flip ${flipped ? "flipped" : ""}`}
@@ -315,6 +424,7 @@ function CardScreen({ cards, paper, topicName, onComplete, onBack }) {
   )
 }
 
+// ── Summary screen ────────────────────────────────────────────────────────────
 function SummaryScreen({ results, paper, topicName, onRetry, onNewTopic }) {
   const knew   = results.filter(r => r.knew).length
   const missed = results.filter(r => !r.knew).length
@@ -322,9 +432,9 @@ function SummaryScreen({ results, paper, topicName, onRetry, onNewTopic }) {
 
   return (
     <div className="screen-summary">
-      <h1 className="screen-title">Session complete</h1>
+      <h2 className="screen-title">Session complete</h2>
       <p className="summary-subtitle">
-        Paper {paper.paper_number} · {paper.year} · {topicName}
+        {paper.paper_number} · {paper.year}{topicName ? ` · ${topicName}` : ""}
       </p>
       <div className="stats-grid">
         <div className="stat-card">
@@ -357,9 +467,9 @@ function SummaryScreen({ results, paper, topicName, onRetry, onNewTopic }) {
       </div>
       <div className="btn-row">
         {missed > 0 && (
-          <button className="btn-primary" onClick={onRetry}>Retry missed cards</button>
+          <button className="btn-primary" onClick={onRetry}>Retry missed</button>
         )}
-        <button className="btn-primary" onClick={onNewTopic}>Choose new topic</button>
+        <button className="btn-primary" onClick={onNewTopic}>Start over</button>
       </div>
     </div>
   )
